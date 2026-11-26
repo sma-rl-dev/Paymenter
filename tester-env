@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Paymenter - Tester Environment CLI. See docs/APP_CLI_PATTERN.md in the corpus.
+# Lives at the root of the sma-rl-dev/paymenter fork (branch tester-env-baseline).
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+# Commands: deploy, seed, verify, reset, stop, logs, status, help
+
+RUN_ID="default"
+PORT="8099"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.tester-env.yml"
+
+# Deterministic credentials (pinned; also recorded in status/apps/paymenter.toml).
+ADMIN_FIRST="Tester"
+ADMIN_LAST="Admin"
+ADMIN_EMAIL="admin@example.com"
+ADMIN_PASSWORD="TesterEnv123!"
+CLIENT_AMELIA_EMAIL="amelia.hart@example.com"
+CLIENT_DANIEL_EMAIL="daniel.okafor@example.com"
+CLIENT_PASSWORD="ClientPass123!"
+SEED_FILE="${SCRIPT_DIR}/tester-env-seed.php"
+APP_KEY="base64:A61cBeTaEJc3eA6UpwePJNmyGO1sNp0nkvScaUcDlvg="
+DB_PASSWORD="paymenter_tester_env_pw"
+DB_ROOT_PASSWORD="paymenter_tester_env_root_pw"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+
+    CONTAINER_NAME="tester-env-paymenter${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-paymenter:dev}"
+    COMPOSE_PROJECT="${COMPOSE_PROJECT_NAME:-tester-env-paymenter${suffix}}"
+    SUFFIX="${suffix}"
+    # Asset/redirect URLs must be reachable from the browser-checker container,
+    # so the manual default is host.docker.internal, NOT localhost (upstream
+    # also drops the port when APP_URL is unset, hence the blank page).
+    # scripts/rl-env and operators override via TESTER_ENV_BROWSER_ORIGIN/APP_URL.
+    APP_URL="${APP_URL:-${TESTER_ENV_BROWSER_ORIGIN:-http://host.docker.internal:${PORT}}}"
+}
+
+compose() {
+    docker compose \
+        -p "${COMPOSE_PROJECT}" \
+        -f "${COMPOSE_FILE}" \
+        --project-directory "${SCRIPT_DIR}" \
+        "$@"
+}
+
+compose_env() {
+    COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT}" \
+    CONTAINER_NAME="${CONTAINER_NAME}" \
+    IMAGE_TAG="${IMAGE_NAME}" \
+    PORT="${PORT}" \
+    SUFFIX="${SUFFIX}" \
+    APP_URL="${APP_URL}" \
+    APP_KEY="${APP_KEY}" \
+    DB_PASSWORD="${DB_PASSWORD}" \
+    DB_ROOT_PASSWORD="${DB_ROOT_PASSWORD}" \
+    compose "$@"
+}
+
+http_code() {
+    curl -s -o /dev/null -w '%{http_code}' "$@" || true
+}
+
+wait_for_health() {
+    local attempt code
+    # First boot runs the full migration set plus seeders; allow ~10 minutes.
+    for attempt in $(seq 1 100); do
+        code=$(http_code --max-time 15 "http://localhost:${PORT}/")
+        if [[ "${code}" == "200" ]]; then
+            echo "==> App healthy after ~${attempt}x6s (GET / -> HTTP 200)"
+            return 0
+        fi
+        sleep 6
+    done
+
+    echo "Error: app did not become healthy at http://localhost:${PORT}/" >&2
+    compose_env logs --tail 80 >&2 || true
+    exit 1
+}
+
+paymenter_exec() {
+    compose_env exec -T paymenter "$@"
+}
+
+ensure_admin() {
+    echo "==> Ensuring deterministic admin (${ADMIN_EMAIL})..."
+    local role_id exists
+    role_id=$(paymenter_exec php artisan tinker --execute="echo \App\Models\Role::where('name','admin')->value('id');" | tr -d '\r\n[:space:]')
+    if [[ -z "${role_id}" ]]; then
+        echo "Error: admin role not seeded yet (migrations may still be running)." >&2
+        exit 1
+    fi
+    exists=$(paymenter_exec php artisan tinker --execute="echo \App\Models\User::where('email','${ADMIN_EMAIL}')->exists() ? 'yes' : 'no';" | tr -d '\r\n[:space:]' | tail -c 3)
+    if [[ "${exists}" != "yes" ]]; then
+        paymenter_exec php artisan "app:user:create" "${ADMIN_FIRST}" "${ADMIN_LAST}" "${ADMIN_EMAIL}" "${ADMIN_PASSWORD}" "${role_id}"
+    else
+        echo "    admin already exists, skipping create."
+    fi
+    # Belt-and-braces: MustVerifyEmail gates client routes per triage notes.
+    paymenter_exec php artisan tinker --execute="\App\Models\User::where('email','${ADMIN_EMAIL}')->whereNull('email_verified_at')->update(['email_verified_at'=>now()]); echo 'verified';"
+    echo "    admin ready (${ADMIN_EMAIL}, role ${role_id}, email verified)."
+}
+
+ensure_app_url() {
+    # The seeded settings.app_url (default http://localhost) overrides
+    # config('app.url') via SettingsProvider and is force-rooted into every
+    # generated URL, so the APP_URL env var alone is not enough: converge the
+    # DB setting to the same browser-reachable origin and flush settings cache.
+    echo "==> Converging settings.app_url to ${APP_URL}..."
+    paymenter_exec php artisan tinker --execute="App\Models\Setting::updateOrCreate(['key'=>'app_url'],['value'=>'${APP_URL}']); App\Providers\SettingsProvider::flushCache(); echo 'app_url set';"
+}
+
+cmd_deploy() {
+    echo "==> Building image from editable source: ${IMAGE_NAME}..."
+    echo "    (cold build: composer install + npm run build; source edits reuse layers)"
+    compose_env build
+
+    echo "==> Starting stack (paymenter + mariadb + redis) on port ${PORT}..."
+    compose_env up -d --no-build
+
+    wait_for_health
+    ensure_app_url
+    cmd_seed
+    cmd_verify --quiet
+
+    echo "==> Deployment complete."
+    echo "    URL:   http://localhost:${PORT}/"
+    echo "    Admin: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD} (/admin)"
+}
+
+require_running() {
+    if ! compose_env ps --status running --format '{{.Name}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"; then
+        echo "Error: container ${CONTAINER_NAME} is not running. Run './tester-env deploy' first." >&2
+        exit 1
+    fi
+}
+
+# Deterministic shop seed lives in tester-env-seed.php (host side, piped into
+# tinker so no image rebuild is needed to change seed data).
+cmd_seed() {
+    require_running
+    ensure_admin
+    if [[ ! -f "${SEED_FILE}" ]]; then
+        echo "Error: seed file ${SEED_FILE} not found." >&2
+        exit 1
+    fi
+    echo "==> Seeding deterministic shop data (tester-env-seed.php via tinker)..."
+    local seed_out
+    seed_out=$(compose_env exec -T paymenter php artisan tinker < "${SEED_FILE}")
+    grep -E "seed-ok" <<<"${seed_out}" | tail -1
+    if ! grep -q "seed-ok" <<<"${seed_out}"; then
+        echo "Error: seed did not report success. Tinker output:" >&2
+        echo "${seed_out}" | tail -20 >&2
+        exit 1
+    fi
+    echo "==> Seed complete."
+}
+
+cmd_verify() {
+    local quiet="${1:-}"
+    require_running
+    [[ "${quiet}" == "--quiet" ]] || echo "==> Verifying public pages over HTTP..."
+
+    local code body
+    body="$(mktemp)"
+    trap 'rm -f "${body:-}"' EXIT
+
+    code=$(curl -s -o "${body}" -w '%{http_code}' --max-time 30 "http://localhost:${PORT}/")
+    if [[ "${code}" != "200" ]]; then
+        echo "Error: GET / returned HTTP ${code}." >&2
+        exit 1
+    fi
+    [[ "${quiet}" == "--quiet" ]] || echo "    home:  / -> HTTP 200"
+
+    code=$(http_code --max-time 30 "http://localhost:${PORT}/login")
+    if [[ "${code}" != "200" ]]; then
+        echo "Error: GET /login returned HTTP ${code}." >&2
+        exit 1
+    fi
+    [[ "${quiet}" == "--quiet" ]] || echo "    login: /login -> HTTP 200"
+
+    code=$(http_code --max-time 30 "http://localhost:${PORT}/admin")
+    if [[ "${code}" != "200" && "${code}" != "302" ]]; then
+        echo "Error: GET /admin returned HTTP ${code} (expected 200 or redirect to login)." >&2
+        exit 1
+    fi
+    [[ "${quiet}" == "--quiet" ]] || echo "    admin: /admin -> HTTP ${code}"
+
+    [[ "${quiet}" == "--quiet" ]] || echo "==> Verifying seeded shop data..."
+    seed_counts=$(paymenter_exec php artisan tinker --execute="echo json_encode(['categories'=>\App\Models\Category::count(),'products'=>\App\Models\Product::count(),'plans'=>\App\Models\Plan::count(),'prices'=>\App\Models\Price::count(),'users'=>\App\Models\User::count(),'orders'=>\App\Models\Order::count(),'services_active'=>\App\Models\Service::where('status','active')->count(),'services_pending'=>\App\Models\Service::where('status','pending')->count(),'invoices_paid'=>\App\Models\Invoice::where('status','paid')->count(),'invoices_pending'=>\App\Models\Invoice::where('status','pending')->count(),'tickets'=>\App\Models\Ticket::count(),'coupons'=>\App\Models\Coupon::count()]);" | tail -1 | tr -d '\r')
+    local expected='{"categories":2,"products":4,"plans":4,"prices":4,"users":3,"orders":2,"services_active":1,"services_pending":1,"invoices_paid":1,"invoices_pending":1,"tickets":2,"coupons":1}'
+    if [[ "${seed_counts}" != "${expected}" ]]; then
+        echo "Error: seed counts mismatch." >&2
+        echo "  got:      ${seed_counts}" >&2
+        echo "  expected: ${expected}" >&2
+        exit 1
+    fi
+    [[ "${quiet}" == "--quiet" ]] || echo "    seed counts OK: ${seed_counts}"
+
+    for page_expect in \
+        "/products/cloud-hosting|Starter VPS" \
+        "/products/cloud-hosting/starter-vps|Add to cart" \
+        "/products/web-hosting/shared-starter|Shared Starter" \
+    ; do
+        local page="${page_expect%%|*}"
+        local needle="${page_expect#*|}"
+        body=$(curl -s --max-time 30 "http://localhost:${PORT}${page}")
+        if ! grep -q "${needle}" <<<"${body}"; then
+            echo "Error: GET ${page} does not contain '${needle}'." >&2
+            exit 1
+        fi
+        [[ "${quiet}" == "--quiet" ]] || echo "    shop: ${page} contains '${needle}'"
+    done
+
+    echo "==> Verify passed."
+}
+
+cmd_reset() {
+    echo "==> Resetting environment (containers + volumes)..."
+    compose_env down -v --remove-orphans || true
+    echo "==> Reset complete. Run 'deploy' to start fresh."
+}
+
+cmd_stop() {
+    echo "==> Stopping stack (data preserved)..."
+    compose_env stop
+}
+
+cmd_logs() {
+    compose_env logs -f --tail 100 "$@"
+}
+
+cmd_status() {
+    if compose_env ps --status running --format '{{.Name}}' 2>/dev/null | grep -qx "${CONTAINER_NAME}"; then
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}/"
+        echo "Browser URL: ${APP_URL}/"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Image: ${IMAGE_NAME}"
+        echo "Credentials: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD}"
+    else
+        echo "Status: NOT RUNNING"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+Paymenter - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build the image from source, start mariadb+redis+paymenter,
+            run migrations/seeds, apply the deterministic shop seed, verify
+  seed      Ensure the deterministic admin exists and (re)apply the
+            deterministic shop seed from tester-env-seed.php (idempotent)
+  verify    Assert /, /login and /admin respond over HTTP, seed counts match,
+            and shop pages show seeded products
+  reset     compose down -v (containers + volumes removed, image kept)
+  stop      Stop the stack (data preserved)
+  tail      Tail stack logs
+  status    Show stack status, URL and credentials
+  help      Show this help message
+
+Options:
+  --run-id <id>   Isolate container, project and volumes for parallel runs. Default: default
+  --port <port>   Host port bound to container port 80. Default: 8099
+
+Typical workflow:
+  ./tester-env deploy    # Build, start, migrate, seed, create admin, verify
+  ./tester-env verify    # Assert pages respond
+  ./tester-env reset     # Clean slate
+
+Deployment details:
+  - Baseline: v1.5.9 (ee729f7d99ac18942625b79f3f93d8d8b21255e8)
+  - Upstream multi-stage Dockerfile (php:8.3-fpm composer + node:22
+    npm run build); compose overrides only the image ref with `build: .`
+  - No app:/app volume and no host theme/extension binds, so rebuilt images
+    (mutants) take effect on restart
+  - Pinned: APP_KEY, DB_PASSWORD, DB_ROOT_PASSWORD (see top of this script)
+  - PAYMENTER_SKIP_DEFAULT=true so theme/extension mutant edits survive restarts
+  - MariaDB: mariadb:lts; cache: redis:alpine
+  - Deterministic admin: ${ADMIN_EMAIL} / ${ADMIN_PASSWORD} (admin role, verified)
+  - Deterministic clients: ${CLIENT_AMELIA_EMAIL} and ${CLIENT_DANIEL_EMAIL} / ${CLIENT_PASSWORD} (verified, no role)
+  - Shop seed: tester-env-seed.php (2 categories, 4 products incl. 1 hidden,
+    4 plans/prices in USD, 2 orders, 1 active + 1 pending service,
+    1 paid + 1 pending invoice, 2 tickets with replies, coupon WELCOME10)
+
+Environment:
+  IMAGE_TAG       Content-addressed image tag exported by scripts/rl-env
+  TESTER_ENV_BROWSER_ORIGIN  Browser-visible origin, used by 'status' only
+
+Caveats:
+  - Cold build runs composer install + npm run build; needs network access.
+  - First boot runs the full migration set plus seeders (slow health gate).
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --run-id)
+                RUN_ID="${2:?--run-id requires a value}"
+                shift 2
+                ;;
+            --port)
+                PORT="${2:?--port requires a value}"
+                shift 2
+                ;;
+            --help|-h)
+                cmd_help
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                cmd_help
+                exit 1
+                ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            echo "Unknown command: ${cmd}" >&2
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

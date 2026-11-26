@@ -1,0 +1,79 @@
+# tester-env compose overlay for Paymenter.
+# Lives at the root of the sma-rl-dev/paymenter fork (branch tester-env-baseline).
+# The tester-env CLI is the supported entry point; it supplies IMAGE_TAG,
+# PORT, COMPOSE_PROJECT_NAME and SUFFIX. Direct
+# `docker compose -f docker-compose.tester-env.yml up --build` also works on
+# port 8099 with the defaults below.
+#
+# Differences from upstream docker-compose.example.yml (deliberate):
+# - paymenter service uses `build:` against the checkout's upstream Dockerfile
+#   (multi-stage php:8.3-fpm + node:22 frontend build) instead of the prebuilt
+#   ghcr.io/paymenter/paymenter:latest image, so source mutations rebuild.
+# - No `app:/app` named volume over /app: that volume would freeze the first
+#   build's code and shadow later mutant rebuilds. The image carries /app.
+# - No host bind-mounts of ./themes and ./extensions: binds would shadow
+#   mutant edits baked into rebuilt images. Mutable state lives in the two
+#   named volumes below (wiped by `reset` / `down -v`).
+name: ${COMPOSE_PROJECT_NAME:-tester-env-paymenter}
+
+services:
+  database:
+    image: mariadb:lts
+    command: --default-authentication-plugin=mysql_native_password
+    volumes:
+      - paymenter-db${SUFFIX:-}:/var/lib/mysql
+    environment:
+      MYSQL_DATABASE: paymenter
+      MYSQL_USER: paymenter
+      MYSQL_PASSWORD: ${DB_PASSWORD:-paymenter_tester_env_pw}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-paymenter_tester_env_root_pw}
+    networks:
+      - paymenter_nw
+
+  cache:
+    image: redis:alpine
+    networks:
+      - paymenter_nw
+
+  paymenter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${IMAGE_TAG:-tester-env-paymenter:dev}
+    container_name: ${CONTAINER_NAME:-tester-env-paymenter}
+    ports:
+      - "${PORT:-8099}:80"
+    volumes:
+      # .env symlink target (entrypoint links /app/.env -> /app/var/.env)
+      - paymenter-var${SUFFIX:-}:/app/var
+      - paymenter-storage${SUFFIX:-}:/app/storage
+    environment:
+      APP_KEY: ${APP_KEY:-base64:A61cBeTaEJc3eA6UpwePJNmyGO1sNp0nkvScaUcDlvg=}
+      # Browser-reachable origin for generated (absolute) asset/redirect URLs.
+      # The CLI passes APP_URL through (pattern: $APP_URL, else
+      # $TESTER_ENV_BROWSER_ORIGIN, else host.docker.internal fallback).
+      APP_URL: ${APP_URL:-http://host.docker.internal:8099}
+      APP_ENV: production
+      CACHE_STORE: redis
+      REDIS_HOST: cache
+      DB_CONNECTION: mariadb
+      DB_HOST: database
+      DB_PORT: "3306"
+      DB_DATABASE: paymenter
+      DB_USERNAME: paymenter
+      DB_PASSWORD: ${DB_PASSWORD:-paymenter_tester_env_pw}
+      # Skip renewal of default themes/extensions on every boot so mutant
+      # edits to themes/extensions survive restarts. First boot still
+      # populates empty themes/extensions dirs from the baked-in defaults.
+      PAYMENTER_SKIP_DEFAULT: "true"
+    networks:
+      - paymenter_nw
+
+networks:
+  paymenter_nw:
+    driver: bridge
+
+volumes:
+  paymenter-db:
+  paymenter-var:
+  paymenter-storage:
